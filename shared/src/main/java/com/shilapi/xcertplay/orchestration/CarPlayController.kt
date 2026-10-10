@@ -1409,6 +1409,18 @@ class CarPlayController(
                         "failureClass=${diagnosticFailureClass(error)}",
                 )
                 logBluetoothConnectionSnapshot(device, "after-failure")
+                // Retry once only when the failure pattern points at SDP/service discovery
+                // (the SYNC+ failure mode); genuine RF failures (out of range, RF loss) would
+                // just burn ~40s in refresh+timeout+retry, so fail fast for those.
+                val failureText = describeThrowable(error)
+                val sdpLike = failureText.contains("Service Discovery", ignoreCase = true) ||
+                    failureText.contains("sdp", ignoreCase = true) ||
+                    failureText.contains("read failed, socket might closed", ignoreCase = true) ||
+                    failureText.contains("-1 on nativeconnect", ignoreCase = true)
+                if (!sdpLike) {
+                    connectionDiagnostic("Bluetooth connect not retrying reason=non-sdp-failure")
+                    throw error
+                }
                 // One retry behind an explicit SDP refresh: the failed connect often triggers
                 // the stack to (re)discover, and a fresh cache unblocks the second attempt.
                 runCatching { activeSocket.close() }
@@ -1438,11 +1450,11 @@ class CarPlayController(
             val stream = synchronized(wirelessResourceLock) {
                 if (isStaleWirelessRun(generation)) return
                 try {
-                    BluetoothRfcommDuplexStream(socket, ::connectionDiagnostic).also { bluetoothStream = it }
+                    BluetoothRfcommDuplexStream(activeSocket, ::connectionDiagnostic).also { bluetoothStream = it }
                 } finally {
                     // The stream owns the connected socket and also closes it if stream getters
                     // fail. Do not retain a second socket owner in bootstrap teardown.
-                    if (bluetoothSocket === socket) bluetoothSocket = null
+                    if (bluetoothSocket === activeSocket) bluetoothSocket = null
                 }
             }
             val channel = Iap2Session.openWireless(
@@ -2451,10 +2463,24 @@ class CarPlayController(
             }
         }
         val refreshed: Boolean = try {
-            appContext.registerReceiver(receiver, IntentFilter(BluetoothDevice.ACTION_UUID))
+            // RECEIVER_NOT_EXPORTED keeps other apps from spoofing ACTION_UUID on Android 13+;
+            // the UUID broadcast is protected-broadcast so stock stacks allow it either way.
+            val flags = if (Build.VERSION.SDK_INT >= 33) Context.RECEIVER_NOT_EXPORTED else 0
+            if (flags == 0) {
+                @Suppress("UnspecifiedRegisterReceiverFlag")
+                appContext.registerReceiver(receiver, IntentFilter(BluetoothDevice.ACTION_UUID))
+            } else {
+                appContext.registerReceiver(receiver, IntentFilter(BluetoothDevice.ACTION_UUID), flags)
+            }
             try {
                 if (device.fetchUuidsWithSdp()) {
-                    val completed = latch.await(SDP_REFRESH_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS)
+                    val completed = try {
+                        latch.await(SDP_REFRESH_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS)
+                    } catch (error: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        debugLog("wireless Bluetooth SDP refresh await interrupted")
+                        false
+                    }
                     if (!completed) {
                         debugLog("wireless Bluetooth SDP refresh timed out after ${SDP_REFRESH_TIMEOUT_MILLIS}ms")
                     }
