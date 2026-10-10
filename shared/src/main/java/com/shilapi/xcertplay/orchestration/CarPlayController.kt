@@ -8,9 +8,11 @@ import android.bluetooth.BluetoothHeadset
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.bluetooth.BluetoothSocket
+import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.hardware.usb.UsbDevice
@@ -1387,6 +1389,9 @@ class CarPlayController(
                 "wireless RFCOMM connecting address=${device.address} " +
                     "uuid=$IAP2_IPHONE_UUID",
             )
+            // OEM stacks with a stale SDP cache (Ford/Lincoln SYNC+, see issues #582/#330/#273)
+            // fail the first RFCOMM connect unless the iAP2 record is refreshed up front.
+            refreshBluetoothSdpCache(device)
             val socket = synchronized(wirelessResourceLock) {
                 if (isStaleWirelessRun(generation)) return
                 device.createRfcommSocketToServiceRecord(UUID.fromString(IAP2_IPHONE_UUID))
@@ -1404,7 +1409,26 @@ class CarPlayController(
                         "failureClass=${diagnosticFailureClass(error)}",
                 )
                 logBluetoothConnectionSnapshot(device, "after-failure")
-                throw error
+                // One retry behind an explicit SDP refresh: the failed connect often triggers
+                // the stack to (re)discover, and a fresh cache unblocks the second attempt.
+                runCatching { socket.close() }
+                refreshBluetoothSdpCache(device)
+                val retrySocket = synchronized(wirelessResourceLock) {
+                    if (isStaleWirelessRun(generation)) return
+                    device.createRfcommSocketToServiceRecord(UUID.fromString(IAP2_IPHONE_UUID))
+                        .also { bluetoothSocket = it }
+                }
+                logBluetoothConnectionSnapshot(device, "before-retry")
+                try {
+                    connectBluetoothSocket(retrySocket, device.address)
+                    connectionDiagnostic("Bluetooth connect retry succeeded elapsedMs=${elapsedMillis(bluetoothStarted)}")
+                } catch (retryError: Throwable) {
+                    connectionDiagnostic(
+                        "Bluetooth connect retry failed failureClass=${diagnosticFailureClass(retryError)}",
+                    )
+                    logBluetoothConnectionSnapshot(device, "after-retry-failure")
+                    throw retryError
+                }
             }
             debugLog("wireless RFCOMM connected address=${device.address}")
             logBluetoothConnectionSnapshot(device, "after-connect")
@@ -2390,6 +2414,67 @@ class CarPlayController(
         }
     }
 
+    /**
+     * Actively refreshes the cached SDP service record for the iPhone before RFCOMM connect.
+     * Some OEM head units (Ford/Lincoln SYNC+ among them) boot with stale or missing cached
+     * service records, so createRfcommSocketToServiceRecord fails with
+     * "Service Discovery failed" even though the iPhone exposes the iAP2 service.
+     * Calling fetchUuidsWithSdp() and awaiting ACTION_UUID closes that loop; the Froyo-era
+     * SDP cache bug documented on AOSP makes the cache stale until an explicit refresh.
+     */
+    private fun refreshBluetoothSdpCache(device: BluetoothDevice): Boolean {
+        val permissionOk = Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
+            appContext.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+        if (!permissionOk) {
+            connectionDiagnostic("Bluetooth SDP refresh skipped reason=connect-permission")
+            return false
+        }
+        val service = UUID.fromString(IAP2_IPHONE_UUID)
+        val alreadyCached = runCatching { device.uuids?.any { it.uuid == service } }.getOrNull() == true
+        if (alreadyCached) {
+            debugLog("wireless Bluetooth iAP2 service already cached; SDP refresh not needed")
+            return true
+        }
+        val latch = CountDownLatch(1)
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(ctx: Context, intent: Intent) {
+                if (intent.action == BluetoothDevice.ACTION_UUID &&
+                    intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)?.address == device.address
+                ) {
+                    latch.countDown()
+                }
+            }
+        }
+        val refreshed: Boolean = try {
+            appContext.registerReceiver(receiver, IntentFilter(BluetoothDevice.ACTION_UUID))
+            try {
+                if (device.fetchUuidsWithSdp()) {
+                    val completed = latch.await(SDP_REFRESH_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS)
+                    if (!completed) {
+                        debugLog("wireless Bluetooth SDP refresh timed out after ${SDP_REFRESH_TIMEOUT_MILLIS}ms")
+                    }
+                    completed
+                } else {
+                    debugLog("wireless Bluetooth SDP refresh could not start fetchUuidsWithSdp=false")
+                    false
+                }
+            } finally {
+                runCatching { appContext.unregisterReceiver(receiver) }
+            }
+        } catch (error: Throwable) {
+            debugLog("wireless Bluetooth SDP refresh failed failureClass=${diagnosticFailureClass(error)}")
+            false
+        }
+        val cachedNow = runCatching { device.uuids?.any { it.uuid == service } }.getOrNull() == true
+        connectionDiagnostic(
+            "Bluetooth SDP refresh point=after-refresh completed=$refreshed " +
+                "cachedIap2Service=$cachedNow",
+        )
+        // A timeout still leaves the refreshed record in the stack cache on many OEM stacks,
+        // so the cache check decides; the latch only bounds how long we wait.
+        return cachedNow
+    }
+
     private fun closeWirelessStack(service: CarPlayVpnService? = vpnService, generation: Int? = null) =
         synchronized(wirelessResourceLock) {
             if (generation != null && generation != wirelessGeneration.get()) return@synchronized
@@ -2833,6 +2918,7 @@ class CarPlayController(
         private const val DEVICE_AVAILABILITY_POLL_INTERVAL_MILLIS = 2_000L
         private const val WIRELESS_HANDOFF_TIMEOUT_MILLIS = 45_000L
         private const val RFCOMM_CONNECT_TIMEOUT_MILLIS = 15_000L
+        private const val SDP_REFRESH_TIMEOUT_MILLIS = 8_000L
         private const val MAXIMUM_REENUMERATION_ATTEMPTS = 2
         private const val EXECUTOR_CLOSE_TIMEOUT_MILLIS = 2_000L
         private const val ADAPTER_ADDRESS_PLACEHOLDER = "02:00:00:00:00:00"
