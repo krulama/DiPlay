@@ -1392,7 +1392,7 @@ class CarPlayController(
             // OEM stacks with a stale SDP cache (Ford/Lincoln SYNC+, see issues #582/#330/#273)
             // fail the first RFCOMM connect unless the iAP2 record is refreshed up front.
             refreshBluetoothSdpCache(device)
-            val socket = synchronized(wirelessResourceLock) {
+            var activeSocket = synchronized(wirelessResourceLock) {
                 if (isStaleWirelessRun(generation)) return
                 device.createRfcommSocketToServiceRecord(UUID.fromString(IAP2_IPHONE_UUID))
                     .also { bluetoothSocket = it }
@@ -1400,9 +1400,9 @@ class CarPlayController(
             logBluetoothConnectionSnapshot(device, "before-connect")
             val bluetoothStarted = System.nanoTime()
             try {
-                connectBluetoothSocket(socket, device.address)
+                connectBluetoothSocket(activeSocket, device.address)
                 connectionDiagnostic("Bluetooth connect completed elapsedMs=${elapsedMillis(bluetoothStarted)} " +
-                    "socketReportedConnected=${runCatching { socket.isConnected }.getOrNull() ?: "unknown"}")
+                    "socketReportedConnected=${runCatching { activeSocket.isConnected }.getOrNull() ?: "unknown"}")
             } catch (error: Throwable) {
                 connectionDiagnostic(
                     "Bluetooth connect failed elapsedMs=${elapsedMillis(bluetoothStarted)} " +
@@ -1411,16 +1411,16 @@ class CarPlayController(
                 logBluetoothConnectionSnapshot(device, "after-failure")
                 // One retry behind an explicit SDP refresh: the failed connect often triggers
                 // the stack to (re)discover, and a fresh cache unblocks the second attempt.
-                runCatching { socket.close() }
+                runCatching { activeSocket.close() }
                 refreshBluetoothSdpCache(device)
-                val retrySocket = synchronized(wirelessResourceLock) {
+                activeSocket = synchronized(wirelessResourceLock) {
                     if (isStaleWirelessRun(generation)) return
                     device.createRfcommSocketToServiceRecord(UUID.fromString(IAP2_IPHONE_UUID))
                         .also { bluetoothSocket = it }
                 }
                 logBluetoothConnectionSnapshot(device, "before-retry")
                 try {
-                    connectBluetoothSocket(retrySocket, device.address)
+                    connectBluetoothSocket(activeSocket, device.address)
                     connectionDiagnostic("Bluetooth connect retry succeeded elapsedMs=${elapsedMillis(bluetoothStarted)}")
                 } catch (retryError: Throwable) {
                     connectionDiagnostic(
@@ -2438,9 +2438,14 @@ class CarPlayController(
         val latch = CountDownLatch(1)
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(ctx: Context, intent: Intent) {
-                if (intent.action == BluetoothDevice.ACTION_UUID &&
-                    intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)?.address == device.address
-                ) {
+                if (intent.action != BluetoothDevice.ACTION_UUID) return
+                val intentDevice = if (Build.VERSION.SDK_INT >= 33) {
+                    intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra<BluetoothDevice>(BluetoothDevice.EXTRA_DEVICE)
+                }
+                if (intentDevice?.address == device.address) {
                     latch.countDown()
                 }
             }
