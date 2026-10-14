@@ -11,6 +11,13 @@ class BootReceiver : BroadcastReceiver() {
         if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
         val launchEnabled = AirPlayPersistence.loadAutoStartOnBoot(context)
         StartupDiagnosticSnapshot.received(context, launchEnabled)
+
+        // OEM decks without an app list (Ford/Lincoln SYNC+) need the launcher bubble even when
+        // auto-start stays off: the bubble is the only way to open DiPlay on those decks.
+        if (HomeScreenBubble.permitted(context) && HomeScreenBubble.enabled(context)) {
+            HomeScreenBubble.scheduleShow(context)
+        }
+
         if (!launchEnabled) return
 
         val launch = Intent(context, DiPlayActivity::class.java).apply {
